@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>PDF 線上閱讀｜行思之間</title>
+  <style>
+    :root { font-family: system-ui, -apple-system, "Noto Sans TC", "Microsoft JhengHei", sans-serif; color: #263341; background: #edf1f5; }
+    * { box-sizing: border-box; }
+    body { margin: 0; }
+    .toolbar { position: sticky; top: 0; z-index: 5; display: flex; flex-wrap: wrap; gap: 10px; align-items: center; justify-content: space-between; padding: 12px 16px; background: #202a36; color: #fff; box-shadow: 0 2px 10px #0002; }
+    .brand { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+    .brand strong { font-size: 15px; font-weight: 650; }
+    .brand small { font-size: 12px; color: #c5d4e4; overflow-wrap: anywhere; }
+    .controls { display: flex; gap: 7px; align-items: center; flex-wrap: wrap; }
+    button, .file-link { appearance: none; border: 1px solid #718298; border-radius: 7px; padding: 7px 11px; background: #35475b; color: #fff; font: inherit; font-size: 13px; text-decoration: none; cursor: pointer; }
+    button:hover, .file-link:hover { background: #4a6580; }
+    button:focus-visible, .file-link:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
+    #zoomLabel { min-width: 48px; text-align: center; font-variant-numeric: tabular-nums; font-size: 13px; }
+    #status { max-width: 860px; margin: 16px auto 0; padding: 0 14px; font-size: 13px; color: #4e6071; }
+    #status.error { color: #a02231; font-weight: 600; }
+    #pages { padding: 8px 12px 24px; }
+    .page-shell { width: 100%; overflow-x: auto; display: flex; justify-content: center; align-items: flex-start; min-height: min(75vh, 780px); padding: 16px 0 22px; }
+    .page-content { position: relative; margin: 0 auto; flex: 0 0 auto; }
+    .page-content canvas { display: block; background: white; box-shadow: 0 5px 22px #26334127; max-width: none; }
+    .page-placeholder { display: flex; align-items: center; justify-content: center; width: min(100%, 760px); height: 55vh; border: 1px dashed #b7c3cf; color: #607386; background: #f8fafc; }
+    .page-label { margin: 8px 0 0; color: #65788b; font-size: 12px; text-align: center; }
+    .note { text-align: center; font-size: 12px; color: #65788b; margin: 0 12px 20px; }
+    @media (max-width: 650px) { .toolbar { padding: 9px 10px; } .brand strong { font-size: 13px; } .controls { gap: 5px; } button, .file-link { padding: 6px 8px; } #pages { padding: 4px 6px 16px; } }
+  </style>
+</head>
+<body>
+  <header class="toolbar">
+    <div class="brand">
+      <strong>講義 PDF｜線上閱讀</strong>
+      <small id="filename">正在準備文件…</small>
+    </div>
+    <div class="controls" aria-label="PDF 閱讀工具">
+      <button id="smaller" type="button" title="縮小">−</button>
+      <span id="zoomLabel">適合寬度</span>
+      <button id="larger" type="button" title="放大">＋</button>
+      <button id="fit" type="button" title="適合寬度">還原</button>
+      <a id="openOriginal" class="file-link" href="#" target="_blank" rel="noopener">開啟原 PDF</a>
+    </div>
+  </header>
+  <div id="status" role="status" aria-live="polite">正在載入 PDF…</div>
+  <main id="pages" aria-label="PDF 文件頁面"></main>
+  <p class="note">使用 PDF.js 顯示文件。可捲動瀏覽各頁；若需搜尋文字、複製或列印，請使用「開啟原 PDF」。</p>
+  <script type="module">
+    const cdnBase = 'https://cdn.jsdelivr.net/npm/pdfjs-dist@6.5.438/';
+    const status = document.getElementById('status');
+    const pages = document.getElementById('pages');
+    const zoomLabel = document.getElementById('zoomLabel');
+    const filename = document.getElementById('filename');
+    const originalLink = document.getElementById('openOriginal');
+    let doc;
+    let zoom = 1;
+    let observer;
+    let generation = 0;
+    let queue = Promise.resolve();
+    const setStatus = (message, isError=false) => { status.textContent = message; status.className = isError ? 'error' : ''; };
+    try {
+      const file = new URLSearchParams(location.search).get('file');
+      if (!file) throw Error('未提供 PDF 檔案網址。請在閱讀器網址後加入 ?file=%2Fmedia%2Ffiles%2F檔名.pdf');
+      const url = new URL(file, location.origin);
+      if (url.origin !== location.origin) throw Error('為保護您的網站，請使用與閱讀器相同網域的 PDF 網址。');
+      if (!url.pathname.toLowerCase().endsWith('.pdf')) throw Error('提供的路徑不是 PDF 檔案。');
+      filename.textContent = decodeURIComponent(url.pathname.split('/').pop());
+      originalLink.href = url.href;
+      const pdfjsLib = await import(cdnBase + 'build/pdf.min.mjs');
+      pdfjsLib.GlobalWorkerOptions.workerSrc = cdnBase + 'build/pdf.worker.min.mjs';
+      const load = pdfjsLib.getDocument({
+        url: url.href,
+        cMapUrl: cdnBase + 'cmaps/', cMapPacked: true,
+        standardFontDataUrl: cdnBase + 'standard_fonts/',
+        wasmUrl: cdnBase + 'wasm/'
+      });
+      doc = await load.promise;
+      setStatus(`共 ${doc.numPages} 頁｜向下捲動即可閱讀`);
+      function buildPageShells() {
+        ++generation;
+        const gen = generation;
+        if (observer) observer.disconnect();
+        pages.replaceChildren();
+        queue = Promise.resolve();
+        const io = new IntersectionObserver(entries => {
+          for (const entry of entries) {
+            if (!entry.isIntersecting || gen !== generation) continue;
+            const shell = entry.target;
+            io.unobserve(shell);
+            const pageNumber = Number(shell.dataset.page);
+            queue = queue.then(() => renderPage(pageNumber, shell, gen)).catch(error => {
+              if (gen === generation) {
+                shell.textContent = `第 ${pageNumber} 頁顯示失敗：${error.message}`;
+                console.error(error);
+              }
+            });
+          }
+        }, { rootMargin: '800px 0px' });
+        observer = io;
+        for (let i = 1; i <= doc.numPages; i++) {
+          const shell = document.createElement('section');
+          shell.className = 'page-shell';
+          shell.dataset.page = String(i);
+          shell.setAttribute('aria-label', `第 ${i} 頁`);
+          const placeholder = document.createElement('div');
+          placeholder.className = 'page-placeholder';
+          placeholder.textContent = `第 ${i} 頁`;
+          shell.appendChild(placeholder);
+          pages.appendChild(shell);
+          io.observe(shell);
+        }
+      }
+      async function renderPage(pageNumber, shell, gen) {
+        if (gen !== generation) return;
+        const page = await doc.getPage(pageNumber);
+        if (gen !== generation) return;
+        const base = page.getViewport({ scale: 1 });
+        const fitWidth = Math.max(250, Math.min(1100, window.innerWidth - 42));
+        const scale = (fitWidth / base.width) * zoom;
+        const viewport = page.getViewport({ scale });
+        const pixelRatio = Math.min(window.devicePixelRatio || 1, 2);
+        const canvas = document.createElement('canvas');
+        canvas.width = Math.round(viewport.width * pixelRatio);
+        canvas.height = Math.round(viewport.height * pixelRatio);
+        canvas.style.width = `${Math.round(viewport.width)}px`;
+        canvas.style.height = `${Math.round(viewport.height)}px`;
+        const container = document.createElement('div');
+        container.className = 'page-content';
+        container.appendChild(canvas);
+        const label = document.createElement('p');
+        label.className = 'page-label';
+        label.textContent = `${pageNumber} / ${doc.numPages}`;
+        container.appendChild(label);
+        const context = canvas.getContext('2d', {alpha: false});
+        if (!context) throw Error('瀏覽器無法建立畫布。');
+        await page.render({canvasContext: context, viewport, transform: [pixelRatio,0,0,pixelRatio,0,0]}).promise;
+        if (gen === generation) shell.replaceChildren(container);
+        page.cleanup();
+      }
+      function updateZoom(multiplier) {
+        zoom = Math.max(0.7, Math.min(2.2, Math.round(zoom * multiplier * 100) / 100));
+        zoomLabel.textContent = zoom === 1 ? '適合寬度' : `${Math.round(zoom * 100)}%`;
+        buildPageShells();
+      }
+      document.getElementById('larger').addEventListener('click', () => updateZoom(1.25));
+      document.getElementById('smaller').addEventListener('click', () => updateZoom(0.8));
+      document.getElementById('fit').addEventListener('click', () => {zoom = 1; zoomLabel.textContent = '適合寬度'; buildPageShells();});
+      let lastWidth = window.innerWidth;
+      window.addEventListener('resize', () => {
+        if (Math.abs(window.innerWidth - lastWidth) > 80) {lastWidth=window.innerWidth; buildPageShells();}
+      });
+      buildPageShells();
+    } catch (error) {
+      console.error(error);
+      setStatus(`無法載入 PDF：${error.message}`, true);
+      filename.textContent = '文件載入失敗';
+    }
+  </script>
+</body>
+</html>
